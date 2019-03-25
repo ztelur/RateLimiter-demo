@@ -2,9 +2,7 @@ package com.remcarpediem.limiter.guavademo.redis;
 
 import com.google.common.base.Preconditions;
 import com.google.common.math.LongMath;
-import io.lettuce.core.RedisClient;
 import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,8 +44,12 @@ public class RateLimiter {
         return permits;
     }
 
-
-
+    /**
+     * acquires the given number of tokens from this {@code RateLimiter}, blocking until the request
+     * can be granted. Tells the amount of time slept, if any
+     * @param tokens
+     * @return time spent sleeping to enforce rate, in millisencods; o if negative or zero
+     */
     public Long acquire(Long tokens) {
         Long milliToWait = reserve(tokens);
         logger.info("acquire for {}ms {}", milliToWait, Thread.currentThread().getName());
@@ -137,5 +139,33 @@ public class RateLimiter {
         return permits.getNextFreeTicketMillis() - now;
     }
 
+
+
+    abstract static class SleepingStopwatch {
+        protected SleepingStopwatch() {}
+
+        protected abstract long readMicros();
+
+        protected abstract void sleepMicrosUninterruptibly(long micros);
+
+
+        public static SleepingStopwatch createFromSystemTimer() {
+            return new SleepingStopwatch() {
+
+                final Stopwatch stopwatch;
+
+                @java.lang.Override
+                protected long readMicros() {
+
+                }
+
+                @java.lang.Override
+                protected void sleepMicrosUninterruptibly(long micros) {
+
+                }
+            }
+        }
+
+    }
 
 }

@@ -2,37 +2,40 @@ package com.remcarpediem.limiter.guavademo.redis;
 
 import java.util.concurrent.TimeUnit;
 
-public class RedisPermits {
-    private Long maxPermits;
-    private Long storedPermits;
+public abstract class RedisPermits {
+    private double maxPermits;
+    private double storedPermits;
     private Long intervalMillis;
-    private Long nextFreeTicketMillis;
+    private Long nextFreeTicketMicros = 0L;
 
 
     public RedisPermits(Long permitsPerSecond, Integer maxBurstSeconds, Long nextFreeTicketMillis) {
         this.maxPermits = (permitsPerSecond * maxBurstSeconds);
         this.storedPermits = permitsPerSecond;
         this.intervalMillis =  new Double(TimeUnit.SECONDS.toMillis(1) / (permitsPerSecond * 1.0)).longValue();
-        this.nextFreeTicketMillis = nextFreeTicketMillis;
+        this.nextFreeTicketMicros = nextFreeTicketMillis;
     }
 
     public Long expires() {
         long now = System.currentTimeMillis();
-        return 2 * TimeUnit.MINUTES.toSeconds(1) + TimeUnit.MILLISECONDS.toSeconds(Math.max(nextFreeTicketMillis, now) - now)
+        return 2 * TimeUnit.MINUTES.toSeconds(1) + TimeUnit.MILLISECONDS.toSeconds(Math.max(nextFreeTicketMicros, now) - now);
         return 1L;
     }
 
-    public Boolean reSync(Long now) {
-        if (now > nextFreeTicketMillis) {
-            storedPermits = Math.min(maxPermits, storedPermits + (now - nextFreeTicketMillis) / intervalMillis);
-            nextFreeTicketMillis = now;
+    public Boolean reSync(Long nowMicros) {
+        if (nowMicros > nextFreeTicketMicros) {
+            double newPermits =  (nowMicros - nextFreeTicketMicros) / coolDownIntervalMicros();
+            storedPermits = Math.min(maxPermits, storedPermits + newPermits);
+            nextFreeTicketMicros = nowMicros;
             return true;
         }
         return false;
     }
 
+    abstract double coolDownIntervalMicros();
 
-    public Long getMaxPermits() {
+
+    public double getMaxPermits() {
         return maxPermits;
     }
 
@@ -40,15 +43,15 @@ public class RedisPermits {
         this.maxPermits = maxPermits;
     }
 
-    public Long getStoredPermits() {
+    public double getStoredPermits() {
         return storedPermits;
     }
 
-    public void setStoredPermits(Long storedPermits) {
+    public void setStoredPermits(double storedPermits) {
         this.storedPermits = storedPermits;
     }
 
-    public Long getIntervalMillis() {
+    public double getIntervalMillis() {
         return intervalMillis;
     }
 
@@ -56,11 +59,11 @@ public class RedisPermits {
         this.intervalMillis = intervalMillis;
     }
 
-    public Long getNextFreeTicketMillis() {
-        return nextFreeTicketMillis;
+    public long getNextFreeTicketMicros() {
+        return nextFreeTicketMicros;
     }
 
-    public void setNextFreeTicketMillis(Long nextFreeTicketMillis) {
-        this.nextFreeTicketMillis = nextFreeTicketMillis;
+    public void setNextFreeTicketMicros(Long nextFreeTicketMicros) {
+        this.nextFreeTicketMicros = nextFreeTicketMicros;
     }
 }

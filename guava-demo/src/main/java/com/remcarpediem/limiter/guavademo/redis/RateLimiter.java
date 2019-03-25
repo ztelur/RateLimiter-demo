@@ -2,13 +2,14 @@ package com.remcarpediem.limiter.guavademo.redis;
 
 import com.google.common.base.Preconditions;
 import com.google.common.math.LongMath;
+import com.google.common.util.concurrent.Uninterruptibles;
 import org.redisson.api.RLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.TimeUnit;
 
-public class RateLimiter {
+public abstract class RateLimiter {
 
     private Logger logger = LoggerFactory.getLogger(RateLimiter.class.getName());
 
@@ -19,7 +20,11 @@ public class RateLimiter {
     private PermitsTemplate permitsTemplate;
     private RLock rLock;
 
-    public RedisPermits redisPermits;
+    RedisPermits redisPermits;
+
+    SleepingStopwatch stopwatch;
+
+    double stableIntervalMicros;
 
     /**
      * 生成并且默认存储令牌桶
@@ -53,7 +58,7 @@ public class RateLimiter {
     public Long acquire(Long tokens) {
         Long milliToWait = reserve(tokens);
         logger.info("acquire for {}ms {}", milliToWait, Thread.currentThread().getName());
-        Thread.sleep(milliToWait);
+        stopwatch.sleepMicrosUninterruptibly(milliToWait);
         return milliToWait;
     }
 
@@ -62,24 +67,25 @@ public class RateLimiter {
     }
 
 
-    public Boolean tryAcquire(Long token, Long timeout, TimeUnit timeUnit) {
-        Long timeoutMicros = Math.max(timeUnit.toMillis(timeout), 0);
-        checkToken(token);
+    public Boolean tryAcquire(int token, Long timeout, TimeUnit timeUnit) {
+        long timeoutMicros = Math.max(timeUnit.toMicros(timeout), 0);
+        checkPermits(token);
 
-        Long milliToWait;
+        long microsToWait;
 
         try {
             rLock.lock();
-            if (!canAcquire(token, timeoutMicros)) {
+            long nowMicros = stopwatch.readMicros();
+            if (!canAcquire(nowMicros, timeoutMicros)) {
                 return false;
             } else {
-                milliToWait = reserveAndGetWaitLength(token);
+                microsToWait = reserveAndGetWaitLength(token);
             }
         } finally {
             rLock.unlock();
         }
 
-        Thread.sleep(milliToWait);
+        stopwatch.sleepMicrosUninterruptibly(microsToWait);
         return true;
     }
 
@@ -88,8 +94,9 @@ public class RateLimiter {
     }
 
 
-    private Long reserve(Long token) throws IllegalArgumentException {
-        checkToken(token);
+    private Long reserve(int token) throws IllegalArgumentException {
+        //checkToken(token);
+        // TODO: 这里可以根据redis和zk进行分布式锁
         try {
             rLock.lock();
             return reserveAndGetWaitLength(token);
@@ -106,39 +113,47 @@ public class RateLimiter {
         return queryEarliestAvailable(token) - timeoutMillis <= 0;
     }
 
-    private Long queryEarliestAvailable(Long token) {
-        Long now = System.currentTimeMillis();
-        RedisPermits permits = this.redisPermits;
-        permits.reSync(now);
+    private Long queryEarliestAvailable(long nowMicros) {
+        //Long now = System.currentTimeMillis();
+        //RedisPermits permits = this.redisPermits;
+        //permits.reSync(now);
+        //
+        //Long storedPermitsToSpend = Math.min(token, permits.getStoredPermits()); //可以消耗的令牌树
+        //Long freshPermits = token - storedPermitsToSpend; // 需要等待的令牌数
+        //Long waitMills = freshPermits * permits.getIntervalMillis();
+        //
+        //return LongMath.checkedAdd(permits.getNextFreeTicketMillis() - now, waitMills);
+        return redisPermits.getNextFreeTicketMicros();
+    }
 
-        Long storedPermitsToSpend = Math.min(token, permits.getStoredPermits()); //可以消耗的令牌树
-        Long freshPermits = token - storedPermitsToSpend; // 需要等待的令牌数
-        Long waitMills = freshPermits * permits.getIntervalMillis();
-
-        return LongMath.checkedAdd(permits.getNextFreeTicketMillis() - now, waitMills);
+    private static void checkPermits(int permits) {
+        Preconditions.checkArgument(permits > 0, "Requested permits (%s) must be positive", permits);
     }
 
 
     /**
      * 获取下一个ticket 然后返回必须等待的时间
-     * @param token
+     * @param requiredPermits
      * @return
      */
-    private Long reserveAndGetWaitLength(Long token) {
+    private Long reserveAndGetWaitLength(int requiredPermits) {
         Long now = System.currentTimeMillis();
         RedisPermits permits = this.redisPermits;
         permits.reSync(now);
+        long returnValue = permits.getNextFreeTicketMicros();
+        double storedPermitsToSpend = Math.min(requiredPermits, permits.getStoredPermits());
 
-        Long storedPermitsToSpend = Math.min(token, permits.getStoredPermits()); //可以消耗的令牌树
-        Long freshPermits = token - storedPermitsToSpend; // 需要等待的令牌数
-        Long waitMills = freshPermits * permits.getIntervalMillis();
-        permits.setNextFreeTicketMillis(LongMath.checkedAdd(permits.getNextFreeTicketMillis(), waitMills));
+        double freshPermits = requiredPermits - storedPermitsToSpend; // 需要等待的令牌数
+
+        long waitMicros = storedPermitsToWaitTime(permits.getStoredPermits(), storedPermitsToSpend + (long) (freshPermits * stableIntervalMicros));
+
+        permits.setNextFreeTicketMicros(LongMath.checkedAdd(permits.getNextFreeTicketMicros(), waitMicros));
         permits.setStoredPermits(permits.getStoredPermits() - storedPermitsToSpend);
         this.redisPermits = permits;
-
-        return permits.getNextFreeTicketMillis() - now;
+        return returnValue;
     }
 
+    abstract long storedPermitsToWaitTime(double storedPermits, double permitsToTake);
 
 
     abstract static class SleepingStopwatch {
@@ -152,18 +167,20 @@ public class RateLimiter {
         public static SleepingStopwatch createFromSystemTimer() {
             return new SleepingStopwatch() {
 
-                final Stopwatch stopwatch;
+                final Stopwatch stopwatch = Stopwatch.createStarted();
 
                 @java.lang.Override
                 protected long readMicros() {
-
+                    return stopwatch.elapsed(TimeUnit.MICROSECONDS);
                 }
 
                 @java.lang.Override
                 protected void sleepMicrosUninterruptibly(long micros) {
-
+                    if (micros > 0) {
+                        Uninterruptibles.sleepUninterruptibly(micros, TimeUnit.MICROSECONDS);
+                    }
                 }
-            }
+            };
         }
 
     }

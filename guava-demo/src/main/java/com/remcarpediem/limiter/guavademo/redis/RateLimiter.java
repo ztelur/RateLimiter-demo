@@ -1,17 +1,49 @@
 package com.remcarpediem.limiter.guavademo.redis;
 
 import com.google.common.base.Preconditions;
-import com.google.common.math.LongMath;
 import com.google.common.util.concurrent.Uninterruptibles;
+import com.remcarpediem.limiter.guavademo.redis.SmoothRateLimiter.SmoothBursty;
 import org.redisson.api.RLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import java.util.concurrent.TimeUnit;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
 
 public abstract class RateLimiter {
 
     private Logger logger = LoggerFactory.getLogger(RateLimiter.class.getName());
+
+
+    public static RateLimiter create(double permitsPerSecond) {
+
+    }
+
+    static RateLimiter create(double permitsPerSecond, SleepingStopwatch stopwatch) {
+        RateLimiter rateLimiter = new SmoothBursty(stopwatch, 1.0);
+        rateLimiter.setRate(permitsPerSecond);
+        return rateLimiter;
+    }
+
+    public static RateLimiter create(double permitsPerSecond, long warmupPeriod, TimeUnit unit) {
+        checkArgument(warmupPeriod >= 0, "warmupPeriod must not be negative: %s", warmupPeriod);
+        return create(
+                permitsPerSecond, warmupPeriod, unit, 3.0, SleepingStopwatch.createFromSystemTimer());
+    }
+
+
+    static RateLimiter create(
+            double permitsPerSecond,
+            long warmupPeriod,
+            TimeUnit unit,
+            double coldFactor,
+            SleepingStopwatch stopwatch) {
+        RateLimiter rateLimiter = new SmoothRateLimiter.SmoothWarmingUp(stopwatch, warmupPeriod, unit, coldFactor);
+        rateLimiter.setRate(permitsPerSecond);
+        return rateLimiter;
+    }
+
 
     private String key;
     private Long permitsPerSecond;
@@ -25,6 +57,11 @@ public abstract class RateLimiter {
     SleepingStopwatch stopwatch;
 
     double stableIntervalMicros;
+
+    RateLimiter(SleepingStopwatch stopwatch) {
+        this.stopwatch = checkNotNull(stopwatch);
+    }
+
 
     /**
      * 生成并且默认存储令牌桶
@@ -49,27 +86,54 @@ public abstract class RateLimiter {
         return permits;
     }
 
+
+    public double acquire() {
+        return acquire(1);
+    }
+
+
+    public final void setRate(double permitsPerSecond) {
+        Preconditions.checkArgument(permitsPerSecond > 0.0 && !Double.isNaN(permitsPerSecond), "rate must be positive");
+        try {
+            rLock.lock();
+            doSetRate(permitsPerSecond, stopwatch.readMicros());
+        } finally {
+            rLock.unlock();
+        }
+    }
+
+    abstract void doSetRate(double permitsPerSecond, long nowMicros);
+
+
+    public final double getRate() {
+        try {
+            rLock.lock();
+            return doGetRate();
+        } finally {
+            rLock.unlock();
+        }
+    }
+
+    abstract double doGetRate();
+
+
     /**
      * acquires the given number of tokens from this {@code RateLimiter}, blocking until the request
      * can be granted. Tells the amount of time slept, if any
      * @param tokens
      * @return time spent sleeping to enforce rate, in millisencods; o if negative or zero
      */
-    public Long acquire(Long tokens) {
+    public double acquire(int tokens) {
         Long milliToWait = reserve(tokens);
         logger.info("acquire for {}ms {}", milliToWait, Thread.currentThread().getName());
         stopwatch.sleepMicrosUninterruptibly(milliToWait);
         return milliToWait;
     }
 
-    public Long acquire() {
-        return acquire(1L);
-    }
 
-
-    public Boolean tryAcquire(int token, Long timeout, TimeUnit timeUnit) {
+    public Boolean tryAcquire(int permits, long timeout, TimeUnit timeUnit) {
         long timeoutMicros = Math.max(timeUnit.toMicros(timeout), 0);
-        checkPermits(token);
+        checkPermits(permits);
 
         long microsToWait;
 
@@ -79,7 +143,7 @@ public abstract class RateLimiter {
             if (!canAcquire(nowMicros, timeoutMicros)) {
                 return false;
             } else {
-                microsToWait = reserveAndGetWaitLength(token);
+                microsToWait = reserveAndGetWaitLength(permits, nowMicros);
             }
         } finally {
             rLock.unlock();
@@ -89,23 +153,29 @@ public abstract class RateLimiter {
         return true;
     }
 
-    private Long now() {
-        return permitsTemplate.execute() ? System.currentTimeMillis();
+    private boolean canAcquire(long nowMicros, long timeoutMicros) {
+        return queryEarliestAvailable(nowMicros) - timeoutMicros <= nowMicros;
     }
 
 
-    private Long reserve(int token) throws IllegalArgumentException {
-        //checkToken(token);
+
+    //private Long now() {
+    //    return permitsTemplate.execute() ? System.currentTimeMillis();
+    //}
+
+
+    private Long reserve(int permits) throws IllegalArgumentException {
+        checkToken(permits);
         // TODO: 这里可以根据redis和zk进行分布式锁
         try {
             rLock.lock();
-            return reserveAndGetWaitLength(token);
+            return reserveAndGetWaitLength(permits, stopwatch.readMicros());
         } finally {
             rLock.unlock();
         }
     }
 
-    private void checkToken(Long token) {
+    private void checkToken(int token) {
         Preconditions.checkArgument(token > 0, "Requested tokens $tokens must be positive");
     }
 
@@ -113,47 +183,49 @@ public abstract class RateLimiter {
         return queryEarliestAvailable(token) - timeoutMillis <= 0;
     }
 
-    private Long queryEarliestAvailable(long nowMicros) {
-        //Long now = System.currentTimeMillis();
-        //RedisPermits permits = this.redisPermits;
-        //permits.reSync(now);
-        //
-        //Long storedPermitsToSpend = Math.min(token, permits.getStoredPermits()); //可以消耗的令牌树
-        //Long freshPermits = token - storedPermitsToSpend; // 需要等待的令牌数
-        //Long waitMills = freshPermits * permits.getIntervalMillis();
-        //
-        //return LongMath.checkedAdd(permits.getNextFreeTicketMillis() - now, waitMills);
-        return redisPermits.getNextFreeTicketMicros();
-    }
+    //private Long queryEarliestAvailable(long nowMicros) {
+    //    //Long now = System.currentTimeMillis();
+    //    //RedisPermits permits = this.redisPermits;
+    //    //permits.reSync(now);
+    //    //
+    //    //Long storedPermitsToSpend = Math.min(token, permits.getStoredPermits()); //可以消耗的令牌树
+    //    //Long freshPermits = token - storedPermitsToSpend; // 需要等待的令牌数
+    //    //Long waitMills = freshPermits * permits.getIntervalMillis();
+    //    //
+    //    //return LongMath.checkedAdd(permits.getNextFreeTicketMillis() - now, waitMills);
+    //    return redisPermits.getNextFreeTicketMicros();
+    //}
 
     private static void checkPermits(int permits) {
         Preconditions.checkArgument(permits > 0, "Requested permits (%s) must be positive", permits);
     }
 
 
-    /**
-     * 获取下一个ticket 然后返回必须等待的时间
-     * @param requiredPermits
-     * @return
-     */
-    private Long reserveAndGetWaitLength(int requiredPermits) {
-        Long now = System.currentTimeMillis();
-        RedisPermits permits = this.redisPermits;
-        permits.reSync(now);
-        long returnValue = permits.getNextFreeTicketMicros();
-        double storedPermitsToSpend = Math.min(requiredPermits, permits.getStoredPermits());
+    private Long reserveAndGetWaitLength(int permits, long nowMicros) {
 
-        double freshPermits = requiredPermits - storedPermitsToSpend; // 需要等待的令牌数
 
-        long waitMicros = storedPermitsToWaitTime(permits.getStoredPermits(), storedPermitsToSpend + (long) (freshPermits * stableIntervalMicros));
+        long momentAvailable = reserveEarliestAvailable(permits, nowMicros);
 
-        permits.setNextFreeTicketMicros(LongMath.checkedAdd(permits.getNextFreeTicketMicros(), waitMicros));
-        permits.setStoredPermits(permits.getStoredPermits() - storedPermitsToSpend);
-        this.redisPermits = permits;
-        return returnValue;
+        return Math.max(momentAvailable - nowMicros, 0);
+
+        //Long now = System.currentTimeMillis();
+        //RedisPermits permits = this.redisPermits;
+        //permits.reSync(now);
+        //long returnValue = permits.getNextFreeTicketMicros();
+        //double storedPermitsToSpend = Math.min(requiredPermits, permits.getStoredPermits());
+        //
+        //double freshPermits = requiredPermits - storedPermitsToSpend; // 需要等待的令牌数
+        //
+        //long waitMicros = storedPermitsToWaitTime(permits.getStoredPermits(), storedPermitsToSpend + (long) (freshPermits * stableIntervalMicros));
+        //
+        //permits.setNextFreeTicketMicros(LongMath.checkedAdd(permits.getNextFreeTicketMicros(), waitMicros));
+        //permits.setStoredPermits(permits.getStoredPermits() - storedPermitsToSpend);
+        //this.redisPermits = permits;
+        //return returnValue;
     }
 
-    abstract long storedPermitsToWaitTime(double storedPermits, double permitsToTake);
+    abstract long reserveEarliestAvailable(int permits, long nowMicros);
+    abstract long queryEarliestAvailable(long nowMicros);
 
 
     abstract static class SleepingStopwatch {

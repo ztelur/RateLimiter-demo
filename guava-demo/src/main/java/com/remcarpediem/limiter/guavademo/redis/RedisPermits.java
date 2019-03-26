@@ -19,7 +19,6 @@ public abstract class RedisPermits {
     public Long expires() {
         long now = System.currentTimeMillis();
         return 2 * TimeUnit.MINUTES.toSeconds(1) + TimeUnit.MILLISECONDS.toSeconds(Math.max(nextFreeTicketMicros, now) - now);
-        return 1L;
     }
 
     public Boolean reSync(Long nowMicros) {
@@ -39,7 +38,7 @@ public abstract class RedisPermits {
         return maxPermits;
     }
 
-    public void setMaxPermits(Long maxPermits) {
+    public void setMaxPermits(double maxPermits) {
         this.maxPermits = maxPermits;
     }
 

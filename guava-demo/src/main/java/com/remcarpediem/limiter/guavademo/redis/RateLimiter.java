@@ -183,18 +183,6 @@ public abstract class RateLimiter {
         return queryEarliestAvailable(token) - timeoutMillis <= 0;
     }
 
-    //private Long queryEarliestAvailable(long nowMicros) {
-    //    //Long now = System.currentTimeMillis();
-    //    //RedisPermits permits = this.redisPermits;
-    //    //permits.reSync(now);
-    //    //
-    //    //Long storedPermitsToSpend = Math.min(token, permits.getStoredPermits()); //可以消耗的令牌树
-    //    //Long freshPermits = token - storedPermitsToSpend; // 需要等待的令牌数
-    //    //Long waitMills = freshPermits * permits.getIntervalMillis();
-    //    //
-    //    //return LongMath.checkedAdd(permits.getNextFreeTicketMillis() - now, waitMills);
-    //    return redisPermits.getNextFreeTicketMicros();
-    //}
 
     private static void checkPermits(int permits) {
         Preconditions.checkArgument(permits > 0, "Requested permits (%s) must be positive", permits);
@@ -202,26 +190,9 @@ public abstract class RateLimiter {
 
 
     private Long reserveAndGetWaitLength(int permits, long nowMicros) {
-
-
         long momentAvailable = reserveEarliestAvailable(permits, nowMicros);
 
         return Math.max(momentAvailable - nowMicros, 0);
-
-        //Long now = System.currentTimeMillis();
-        //RedisPermits permits = this.redisPermits;
-        //permits.reSync(now);
-        //long returnValue = permits.getNextFreeTicketMicros();
-        //double storedPermitsToSpend = Math.min(requiredPermits, permits.getStoredPermits());
-        //
-        //double freshPermits = requiredPermits - storedPermitsToSpend; // 需要等待的令牌数
-        //
-        //long waitMicros = storedPermitsToWaitTime(permits.getStoredPermits(), storedPermitsToSpend + (long) (freshPermits * stableIntervalMicros));
-        //
-        //permits.setNextFreeTicketMicros(LongMath.checkedAdd(permits.getNextFreeTicketMicros(), waitMicros));
-        //permits.setStoredPermits(permits.getStoredPermits() - storedPermitsToSpend);
-        //this.redisPermits = permits;
-        //return returnValue;
     }
 
     abstract long reserveEarliestAvailable(int permits, long nowMicros);
